@@ -26,15 +26,21 @@
     .badge { padding: .1rem .5rem; border-radius: 999px; font-size: .75rem; }
     .pending { background: #fef3c7; }
     .processing { background: #dbeafe; }
+    .held { background: #e5e7eb; }
     .passed { background: #dcfce7; }
     .failed { background: #fee2e2; }
     .muted { color: #6b7280; }
+    form.inline { display: inline; margin: 0; }
+    button.act { padding: .25rem .7rem; font-size: .8rem; }
+    button.hold { background: #d97706; }
+    button.resume { background: #059669; }
   </style>
 </head>
 <body>
   <h1>SHA-256 文件校验平台</h1>
   <p class="muted">上传不超过 {{ limit_mib }} MiB 的文件并提供预期 SHA-256；
-     仅校验通过（passed）的制品可以下载。</p>
+     仅校验通过（passed）的制品可以下载。来源存疑的制品可先「暂缓」校验，
+     「继续」后会重新读取原文件校验。</p>
 
   {% with messages = get_flashed_messages(with_categories=true) %}
     {% for category, msg in messages %}
@@ -55,8 +61,12 @@
     <div><button type="submit">上传并受理</button></div>
   </form>
 
+  {% set labels = {
+      "pending": "待校验", "processing": "校验中", "held": "暂缓",
+      "passed": "通过", "failed": "不符"} %}
   {% set columns = [
       ("pending", "待校验 / 校验中（pending / processing）"),
+      ("held", "已暂缓（held）"),
       ("passed", "校验通过（passed）"),
       ("failed", "摘要不符（failed）")] %}
   {% for key, title in columns %}
@@ -71,7 +81,7 @@
         <tr>
           <td><code>{{ row.id }}</code></td>
           <td>{{ row.original_name }}</td>
-          <td><span class="badge {{ row.status }}">{{ row.status }}</span></td>
+          <td><span class="badge {{ row.status }}">{{ labels.get(row.status, row.status) }}</span></td>
           <td>
             <div>预期 <code>{{ row.expected_sha256 }}</code></div>
             {% if row.actual_sha256 %}
@@ -84,6 +94,16 @@
           <td>
             {% if row.status == "passed" %}
               <a href="{{ url_for('download', artifact_id=row.id) }}">下载</a>
+            {% elif row.status in ("pending", "processing") %}
+              <form class="inline" method="post"
+                    action="{{ url_for('hold', artifact_id=row.id) }}">
+                <button type="submit" class="act hold">暂缓</button>
+              </form>
+            {% elif row.status == "held" %}
+              <form class="inline" method="post"
+                    action="{{ url_for('resume', artifact_id=row.id) }}">
+                <button type="submit" class="act resume">继续</button>
+              </form>
             {% else %}
               <span class="muted">—</span>
             {% endif %}

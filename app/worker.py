@@ -48,23 +48,26 @@ class VerificationWorker:
     # ------------------------------------------------------------------ #
     def _handle_message(self, stream_id: str, fields: dict,
                         takeover: bool = False) -> None:
-        artifact_id = queue.parse_artifact_id(fields)
-        if not artifact_id:
+        job = queue.parse_job(fields)
+        if not job:
             log.error("malformed message %s: %r -> ACK and drop",
                       stream_id, fields)
             queue.ack(self._r, stream_id)
             return
+        artifact_id, epoch = job
 
         if takeover:
             row = db.takeover_for_processing(
                 artifact_id, self.worker_id, stream_id)
         else:
-            row = db.claim_for_processing(artifact_id, self.worker_id)
+            row = db.claim_for_processing(
+                artifact_id, self.worker_id, stream_id, epoch)
         if row is None:
-            # Duplicate delivery / takeover of an already decided job or a
-            # superseded message. The conditional claim found no eligible row,
-            # so there is nothing to do: ACK removes the duplicate from the
-            # PEL. Confirmed results are never touched.
+            # Duplicate delivery, a pre-hold message from an older dispatch
+            # epoch, a message for a held artifact, or a takeover of an
+            # already decided job. The conditional claim found no eligible
+            # row, so there is nothing to do: ACK removes the message from
+            # the PEL. Confirmed results are never touched.
             log.info("artifact %s not eligible (takeover=%s); ACK %s",
                      artifact_id, takeover, stream_id)
             queue.ack(self._r, stream_id)
@@ -89,10 +92,13 @@ class VerificationWorker:
         except OSError as exc:
             # Read failure -> retry, NOT a digest mismatch. Commit the
             # pending+backoff state first, ACK the old message, then unbind so
-            # the reconciler publishes exactly one fresh retry message.
+            # the reconciler publishes exactly one fresh retry message. If the
+            # row was held/re-dispatched meanwhile, the conditional update is
+            # a no-op and the row is left alone.
             log.warning("read failure for %s: %s (will retry)",
                         artifact_id, exc)
-            db.record_read_failure(artifact_id, self.worker_id, str(exc))
+            db.record_read_failure(
+                artifact_id, self.worker_id, stream_id, str(exc))
             queue.ack(self._r, stream_id)
             db.detach_after_ack(artifact_id, stream_id)
             return
@@ -109,13 +115,15 @@ class VerificationWorker:
             log.info("artifact %s FAILED digest check", artifact_id)
 
         finalized = db.finalize_artifact(
-            artifact_id, self.worker_id, status, actual, error
+            artifact_id, self.worker_id, stream_id, status, actual, error
         )
         if not finalized:
-            # Another worker/attempt already wrote a conclusion. Never
-            # overwrite it; just retire this duplicate message.
-            log.warning("artifact %s had a concurrent conclusion; "
-                        "keeping the confirmed result", artifact_id)
+            # The row is no longer ours: a conclusion was already committed,
+            # the artifact was held, or resume re-dispatched it to another
+            # worker. Never overwrite; just retire this message.
+            log.warning("artifact %s no longer owned by message %s "
+                        "(concluded, held or superseded); keeping the "
+                        "confirmed state", artifact_id, stream_id)
         queue.ack(self._r, stream_id)
 
     # ------------------------------------------------------------------ #

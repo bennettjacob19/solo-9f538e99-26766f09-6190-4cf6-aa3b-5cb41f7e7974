@@ -1,9 +1,15 @@
-"""Flask web UI: upload (file + expected SHA-256), status lists, downloads.
+"""Flask web UI: upload (file + expected SHA-256), status lists, downloads,
+and hold/resume of undecided artifacts.
 
 Only artifacts whose confirmed status is ``passed`` can be downloaded.
 Uploads are persisted (file + DB row in ``pending``) before any queue
 interaction; the reconciler thread guarantees eventual dispatch even when
 Redis is down or the process restarts.
+
+A release engineer can pause (暂缓) an artifact whose source is questionable:
+the hold is recorded atomically in SQLite, in-flight queue messages lose the
+right to write a conclusion, and a later resume (继续) starts a fresh
+verification that re-reads the stored file.
 """
 from __future__ import annotations
 
@@ -12,11 +18,12 @@ import os
 import uuid
 from pathlib import Path
 
+import redis as redis_lib
 from flask import (Flask, Response, abort, flash, redirect, render_template,
                    request, send_file, url_for)
 from werkzeug.utils import secure_filename
 
-from . import checksums, config, db
+from . import checksums, config, db, queue
 from .reconciler import Reconciler
 
 log = logging.getLogger("web")
@@ -49,6 +56,7 @@ def create_app() -> Flask:
         groups = {
             "pending": db.list_by_status(db.ST_PENDING)
             + db.list_by_status(db.ST_PROCESSING),
+            "held": db.list_by_status(db.ST_HELD),
             "passed": db.list_by_status(db.ST_PASSED),
             "failed": db.list_by_status(db.ST_FAILED),
         }
@@ -110,6 +118,59 @@ def create_app() -> Flask:
         resp.headers["X-Artifact-Id"] = artifact_id
         resp.headers["X-SHA256"] = row["actual_sha256"] or ""
         return resp
+
+    # ------------------------------------------------------------------ #
+    # Hold / resume of undecided artifacts (release-engineer actions).
+    def _drop_stale_message(stream_id: str | None) -> None:
+        """Best-effort removal of the queue message a hold just unbound.
+
+        Correctness never depends on this: workers reject stale messages via
+        the DB-side epoch/binding checks. Deleting simply keeps the stream
+        tidy; if Redis is down the message is dropped on delivery instead.
+        """
+        if not stream_id:
+            return
+        try:
+            queue.delete_message(queue.get_redis(), stream_id)
+        except redis_lib.RedisError as exc:
+            log.warning("could not delete stale message %s: %s",
+                        stream_id, exc)
+
+    @app.post("/artifacts/<artifact_id>/hold")
+    def hold(artifact_id):
+        result, row = db.hold_artifact(artifact_id)
+        short = artifact_id[:8]
+        if result == db.HOLD_HELD:
+            _drop_stale_message(row["stream_id"])
+            log.info("artifact %s held by release engineer", artifact_id)
+            flash(f"已暂缓制品 {short}… 的校验；在继续之前不会得出任何结论。",
+                  "ok")
+        elif result == db.HOLD_ALREADY:
+            flash(f"制品 {short}… 已处于暂缓状态，保持暂缓。", "ok")
+        elif result == db.HOLD_TERMINAL:
+            flash(f"暂缓被拒绝：制品 {short}… 已有结论 "
+                  f"（{row['status']}），结论保持不变。", "error")
+        else:
+            abort(404)
+        return redirect(url_for("index"))
+
+    @app.post("/artifacts/<artifact_id>/resume")
+    def resume(artifact_id):
+        result, row = db.resume_artifact(artifact_id)
+        short = artifact_id[:8]
+        if result == db.RESUME_RESUMED:
+            log.info("artifact %s resumed; fresh dispatch scheduled",
+                     artifact_id)
+            flash(f"已继续制品 {short}…：将自动重新派发并重新读取原文件校验。",
+                  "ok")
+        elif result == db.RESUME_ACTIVE:
+            flash(f"制品 {short}… 已在校验流程中，保持继续。", "ok")
+        elif result == db.RESUME_TERMINAL:
+            flash(f"继续被拒绝：制品 {short}… 已有结论 "
+                  f"（{row['status']}），结论保持不变。", "error")
+        else:
+            abort(404)
+        return redirect(url_for("index"))
 
     return app
 

@@ -47,8 +47,9 @@ class Reconciler(threading.Thread):
             if self._stop.is_set():
                 return
             artifact_id = row["id"]
+            epoch = row["dispatch_epoch"]
             try:
-                stream_id = queue.publish_job(self._r, artifact_id)
+                stream_id = queue.publish_job(self._r, artifact_id, epoch)
             except redis.RedisError as exc:
                 log.warning("enqueue failed for %s: %s", artifact_id, exc)
                 try:
@@ -59,11 +60,12 @@ class Reconciler(threading.Thread):
                 self._stop.wait(min(2.0, config.DISPATCH_INTERVAL))
                 continue
             # XADD succeeded; bind the message to the row atomically. If the
-            # row is no longer eligible (defensive: concurrent change), remove
-            # the orphan message so it cannot resurrect a finished job.
-            if db.attach_stream_id(artifact_id, stream_id):
-                log.info("dispatched artifact %s -> %s",
-                         artifact_id, stream_id)
+            # row is no longer eligible (held meanwhile, or resumed into a
+            # newer epoch), remove the orphan message so it cannot resurrect
+            # or decide the job.
+            if db.attach_stream_id(artifact_id, stream_id, epoch):
+                log.info("dispatched artifact %s -> %s (epoch %d)",
+                         artifact_id, stream_id, epoch)
             else:
                 log.warning("artifact %s rejected binding; deleting orphan %s",
                             artifact_id, stream_id)

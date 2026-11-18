@@ -48,12 +48,16 @@ def ensure_group(r: redis.Redis) -> None:
         log.info("consumer group %s already exists", config.GROUP_NAME)
 
 
-def publish_job(r: redis.Redis, artifact_id: str) -> str:
+def publish_job(r: redis.Redis, artifact_id: str, epoch: int) -> str:
     """XADD one job message. Raises redis.RedisError on failure so the
-    reconciler can record the failure and retry later."""
+    reconciler can record the failure and retry later.
+
+    The message carries the artifact's current ``dispatch_epoch`` so workers
+    can recognise (and drop) messages published before a hold/resume cycle.
+    """
     return r.xadd(
         config.STREAM_KEY,
-        {"artifact_id": artifact_id},
+        {"artifact_id": artifact_id, "epoch": str(epoch)},
         maxlen=100_000,
         approximate=True,
     )
@@ -157,16 +161,26 @@ def pending_entry_ids(r: redis.Redis) -> set[str]:
     return ids
 
 
-def parse_artifact_id(fields: dict) -> Optional[str]:
-    """Defensive parsing: messages are produced by us as hash fields, but a
-    malformed entry must not crash the worker."""
+def parse_job(fields: dict) -> Optional[tuple[str, int]]:
+    """Parse one stream message into ``(artifact_id, dispatch_epoch)``.
+
+    Defensive: messages are produced by us as hash fields, but a malformed
+    entry must not crash the worker. Messages without a valid epoch are
+    foreign (or hand-injected duplicates) and must be ACKed and dropped —
+    they can never drive a verification.
+    """
     aid = fields.get("artifact_id")
-    if aid:
-        return aid
-    raw = fields.get("data") or fields.get("payload")
-    if raw:
-        try:
-            return json.loads(raw).get("artifact_id")
-        except (ValueError, TypeError):
-            return None
-    return None
+    if not aid:
+        raw = fields.get("data") or fields.get("payload")
+        if raw:
+            try:
+                aid = json.loads(raw).get("artifact_id")
+            except (ValueError, TypeError):
+                aid = None
+    if not aid:
+        return None
+    try:
+        epoch = int(fields.get("epoch"))
+    except (TypeError, ValueError):
+        return None
+    return aid, epoch
